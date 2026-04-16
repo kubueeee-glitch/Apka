@@ -66,10 +66,9 @@ class DriverModeActivity : AppCompatActivity(), VoiceEngine.Listener {
                 }
             }
         )
-        gemini = GeminiClient(
-            prefs.getString("gemini_api_key", "").orEmpty(),
-            memory, skills, personas
-        )
+        val key = prefs.getString("gemini_api_key", "").orEmpty()
+            .ifBlank { BuildConfig.GEMINI_API_KEY }
+        gemini = GeminiClient(key, memory, skills, personas)
         voice = VoiceEngine(this, this)
         voice.init()
 

@@ -57,10 +57,9 @@ class MainActivity : AppCompatActivity(), VoiceEngine.Listener, PhoneController.
         notes = NotesStore(this)
         personas = PersonaStore(this)
         controller = PhoneController(this, memory, skills, notes, personas, this)
-        gemini = GeminiClient(
-            prefs.getString(KEY_API, "").orEmpty(),
-            memory, skills, personas
-        )
+        val effectiveKey = prefs.getString(KEY_API, "").orEmpty()
+            .ifBlank { BuildConfig.GEMINI_API_KEY }
+        gemini = GeminiClient(effectiveKey, memory, skills, personas)
         voice = VoiceEngine(this, this)
 
         cameraLauncher = registerForActivityResult(
@@ -100,7 +99,7 @@ class MainActivity : AppCompatActivity(), VoiceEngine.Listener, PhoneController.
             "Cześć! Jestem Benedykt. Naciśnij mikrofon lub powiedz \"Hej Benedykt\"."
         )
 
-        if (prefs.getString(KEY_API, "").isNullOrBlank()) {
+        if (effectiveKey.isBlank()) {
             askForApiKey()
         }
 
