@@ -1,6 +1,8 @@
 package com.benedykt.assistant
 
 import android.annotation.SuppressLint
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.ContentResolver
 import android.content.Context
 import android.content.Intent
@@ -14,20 +16,34 @@ import android.provider.MediaStore
 import android.provider.Settings
 import android.provider.Telephony
 import androidx.core.net.toUri
+import org.json.JSONArray
 import org.json.JSONObject
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
 /**
- * Wykonuje komendy, które model Gemini wywołał jako "function calls".
- * Zwraca wynik w formie JSONObject – oddawany z powrotem do modelu.
+ * Wykonuje function calls modelu – zarówno akcje telefonu, jak i
+ * zarządzanie pamięcią, skillami, notatkami, osobowościami i wizją.
  */
-class PhoneController(private val context: Context) {
+class PhoneController(
+    private val context: Context,
+    private val memory: MemoryStore,
+    private val skills: SkillsStore,
+    private val notes: NotesStore,
+    private val personas: PersonaStore,
+    private val callbacks: Callbacks
+) {
+
+    /** Callbacki do MainActivity dla funkcji wymagających UI (np. aparat). */
+    interface Callbacks {
+        fun onRequestVision(question: String?)
+    }
 
     fun execute(call: FunctionCall): JSONObject {
         return try {
             when (call.name) {
+                // --- Telefon --- //
                 "open_app" -> openApp(call.args.optString("app_name"))
                 "make_call" -> makeCall(
                     call.args.optString("number"),
@@ -64,6 +80,48 @@ class PhoneController(private val context: Context) {
                 "play_music" -> playMusic(call.args.optString("query"))
                 "get_battery" -> getBattery()
                 "get_time" -> getTime()
+
+                // --- Pamięć --- //
+                "remember" -> remember(
+                    call.args.optString("topic"),
+                    call.args.optString("value")
+                )
+                "forget" -> forget(call.args.optString("topic"))
+                "list_memory" -> listMemory()
+
+                // --- Skille --- //
+                "create_skill" -> createSkill(
+                    call.args.optString("name"),
+                    call.args.optString("description"),
+                    call.args.optString("steps")
+                )
+                "run_skill" -> runSkill(call.args.optString("name"))
+                "delete_skill" -> deleteSkill(call.args.optString("name"))
+                "list_skills" -> listSkills()
+
+                // --- Notatki --- //
+                "save_note" -> saveNote(
+                    call.args.optString("content"),
+                    call.args.optString("category")
+                )
+                "list_notes" -> listNotes(
+                    call.args.optString("query"),
+                    call.args.optString("category")
+                )
+
+                // --- Osobowość --- //
+                "set_persona" -> setPersona(call.args.optString("persona"))
+
+                // --- Schowek --- //
+                "read_clipboard" -> readClipboard()
+                "write_clipboard" -> writeClipboard(call.args.optString("text"))
+
+                // --- Wizja --- //
+                "analyze_image" -> analyzeImage(call.args.optString("question"))
+
+                // --- Briefing --- //
+                "morning_briefing" -> morningBriefing()
+
                 else -> fail("Nieznana funkcja: ${call.name}")
             }
         } catch (t: Throwable) {
@@ -71,7 +129,7 @@ class PhoneController(private val context: Context) {
         }
     }
 
-    // --- Implementacje akcji --- //
+    // --- Telefon --- //
 
     private fun openApp(appName: String): JSONObject {
         if (appName.isBlank()) return fail("Brak nazwy aplikacji.")
@@ -262,7 +320,6 @@ class PhoneController(private val context: Context) {
             context.startActivity(launch)
             return ok(if (q != null) "Puszczam $q." else "Włączam muzykę.")
         }
-        // Fallback – YouTube search
         val url = "https://music.youtube.com/search?q=" + Uri.encode(q ?: "muzyka")
         context.startActivity(
             Intent(Intent.ACTION_VIEW, url.toUri()).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
@@ -286,6 +343,142 @@ class PhoneController(private val context: Context) {
         return ok("Jest $time, $date.")
             .put("time", time)
             .put("date", date)
+    }
+
+    // --- Pamięć --- //
+
+    private fun remember(topic: String, value: String): JSONObject {
+        if (topic.isBlank() || value.isBlank()) return fail("Potrzebny temat i wartość.")
+        memory.remember(topic, value)
+        return ok("Zapamiętałem: $topic – $value.")
+    }
+
+    private fun forget(topic: String): JSONObject {
+        if (topic.isBlank()) return fail("Podaj temat do zapomnienia.")
+        val removed = memory.forget(topic)
+        return if (removed) ok("Zapomniałem o $topic.")
+        else fail("Nie miałem nic zapisanego dla '$topic'.")
+    }
+
+    private fun listMemory(): JSONObject {
+        val facts = memory.all()
+        val arr = JSONArray()
+        facts.forEach {
+            arr.put(JSONObject().put("topic", it.topic).put("value", it.value))
+        }
+        return ok(if (facts.isEmpty()) "Pusta pamięć." else "Pamiętam ${facts.size} faktów.")
+            .put("facts", arr)
+    }
+
+    // --- Skille --- //
+
+    private fun createSkill(name: String, description: String, steps: String): JSONObject {
+        if (name.isBlank() || steps.isBlank()) return fail("Potrzebna nazwa i kroki.")
+        skills.upsert(name.trim(), description.trim(), steps.trim())
+        return ok("Skill \"$name\" zapisany.")
+    }
+
+    private fun runSkill(name: String): JSONObject {
+        val s = skills.findByName(name) ?: return fail("Nie znam skilla \"$name\".")
+        return ok("Kroki skilla '${s.name}'.")
+            .put("name", s.name)
+            .put("description", s.description)
+            .put("steps", s.steps)
+    }
+
+    private fun deleteSkill(name: String): JSONObject {
+        val removed = skills.delete(name)
+        return if (removed) ok("Usunąłem skill \"$name\".")
+        else fail("Nie ma skilla \"$name\".")
+    }
+
+    private fun listSkills(): JSONObject {
+        val list = skills.all()
+        val arr = JSONArray()
+        list.forEach {
+            arr.put(
+                JSONObject()
+                    .put("name", it.name)
+                    .put("description", it.description)
+            )
+        }
+        return ok(if (list.isEmpty()) "Brak skilli." else "Masz ${list.size} skilli.")
+            .put("skills", arr)
+    }
+
+    // --- Notatki --- //
+
+    private fun saveNote(content: String, category: String?): JSONObject {
+        if (content.isBlank()) return fail("Notatka jest pusta.")
+        val note = notes.add(content, category)
+        return ok("Zapisałem notatkę w kategorii '${note.category}'.")
+    }
+
+    private fun listNotes(query: String?, category: String?): JSONObject {
+        val filtered = notes.filter(query, category)
+        val arr = JSONArray()
+        filtered.take(20).forEach {
+            arr.put(
+                JSONObject()
+                    .put("category", it.category)
+                    .put("content", it.content)
+                    .put("createdAt", it.createdAt)
+            )
+        }
+        return ok("Znalazłem ${filtered.size} notatek.")
+            .put("notes", arr)
+            .put("formatted", notes.format(filtered))
+    }
+
+    // --- Osobowość --- //
+
+    private fun setPersona(personaId: String): JSONObject {
+        if (personaId.isBlank()) return fail("Podaj nazwę osobowości.")
+        val p = personas.set(personaId)
+        return ok("Przełączam się na tryb: ${p.label}.")
+    }
+
+    // --- Schowek --- //
+
+    private fun readClipboard(): JSONObject {
+        val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        val clip = cm.primaryClip
+        val text = (0 until (clip?.itemCount ?: 0))
+            .mapNotNull { clip?.getItemAt(it)?.coerceToText(context)?.toString() }
+            .joinToString("\n")
+        return if (text.isBlank()) fail("Schowek jest pusty.")
+        else ok("Schowek odczytany.").put("text", text)
+    }
+
+    private fun writeClipboard(text: String): JSONObject {
+        if (text.isBlank()) return fail("Pusty tekst.")
+        val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        cm.setPrimaryClip(ClipData.newPlainText("Benedykt", text))
+        return ok("Skopiowałem tekst do schowka.")
+    }
+
+    // --- Wizja --- //
+
+    private fun analyzeImage(question: String?): JSONObject {
+        callbacks.onRequestVision(question?.takeIf { it.isNotBlank() })
+        return ok("Włączam aparat – zrób zdjęcie, a potem opiszę co widzę.")
+    }
+
+    // --- Briefing --- //
+
+    private fun morningBriefing(): JSONObject {
+        val time = getTime().optString("time")
+        val date = getTime().optString("date")
+        val bm = context.getSystemService(Context.BATTERY_SERVICE) as BatteryManager
+        val level = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
+        val charging = bm.isCharging
+        val text = "Jest $time, $date. Bateria: $level procent" +
+            if (charging) ", ładuje się." else "."
+        return ok(text)
+            .put("time", time)
+            .put("date", date)
+            .put("battery_level", level)
+            .put("battery_charging", charging)
     }
 
     // --- Helpers --- //

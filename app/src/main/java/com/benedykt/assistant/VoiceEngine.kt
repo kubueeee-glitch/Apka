@@ -2,17 +2,23 @@ package com.benedykt.assistant
 
 import android.content.Context
 import android.content.Intent
+import android.media.MediaRecorder
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
+import java.io.File
 import java.util.Locale
 
 /**
- * Łączy rozpoznawanie mowy (SpeechRecognizer) oraz syntezę (TextToSpeech)
- * w prosty interfejs używany przez asystenta.
+ * STT + TTS + barge-in.
+ * Barge-in: w trakcie odtwarzania TTS monitorujemy amplitudę mikrofonu przez
+ * MediaRecorder. Jeśli użytkownik zaczyna mówić głośno – TTS jest przerywany
+ * i automatycznie włącza się pełne rozpoznawanie mowy.
  */
 class VoiceEngine(
     private val context: Context,
@@ -25,6 +31,7 @@ class VoiceEngine(
         fun onRecognitionError(errorCode: Int)
         fun onSpeechStarted()
         fun onSpeechFinished()
+        fun onBargeIn()
         fun onTtsReady(available: Boolean)
     }
 
@@ -32,6 +39,14 @@ class VoiceEngine(
     private var tts: TextToSpeech? = null
     private var ttsReady = false
     private var isListening = false
+
+    // --- Barge-in --- //
+    private var bargeRecorder: MediaRecorder? = null
+    private var bargeFile: File? = null
+    private val handler = Handler(Looper.getMainLooper())
+    private var bargeActive = false
+    private var calibratedBaseline = 600
+    private var samples = 0
 
     fun init() {
         if (!SpeechRecognizer.isRecognitionAvailable(context)) {
@@ -53,14 +68,17 @@ class VoiceEngine(
                 tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
                     override fun onStart(utteranceId: String?) {
                         listener.onSpeechStarted()
+                        startBargeIn()
                     }
 
                     override fun onDone(utteranceId: String?) {
+                        stopBargeIn()
                         listener.onSpeechFinished()
                     }
 
                     @Deprecated("Deprecated in Java")
                     override fun onError(utteranceId: String?) {
+                        stopBargeIn()
                         listener.onSpeechFinished()
                     }
                 })
@@ -73,6 +91,7 @@ class VoiceEngine(
 
     fun startListening() {
         if (isListening) return
+        stopBargeIn()
         val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
             putExtra(
                 RecognizerIntent.EXTRA_LANGUAGE_MODEL,
@@ -83,7 +102,10 @@ class VoiceEngine(
             putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
             putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, context.packageName)
             putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 1500L)
-            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 1500L)
+            putExtra(
+                RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS,
+                1500L
+            )
         }
         try {
             recognizer?.startListening(intent)
@@ -115,16 +137,72 @@ class VoiceEngine(
 
     fun stopSpeaking() {
         tts?.stop()
+        stopBargeIn()
     }
 
     fun release() {
         stopListening()
+        stopBargeIn()
         recognizer?.destroy()
         recognizer = null
         tts?.stop()
         tts?.shutdown()
         tts = null
         ttsReady = false
+    }
+
+    // --- Barge-in --- //
+
+    private fun startBargeIn() {
+        if (bargeActive) return
+        try {
+            bargeFile = File.createTempFile("bene-barge", ".3gp", context.cacheDir)
+            bargeRecorder = MediaRecorder().apply {
+                setAudioSource(MediaRecorder.AudioSource.MIC)
+                setOutputFormat(MediaRecorder.OutputFormat.THREE_GPP)
+                setAudioEncoder(MediaRecorder.AudioEncoder.AMR_NB)
+                setOutputFile(bargeFile!!.absolutePath)
+                prepare()
+                start()
+            }
+            bargeActive = true
+            samples = 0
+            calibratedBaseline = 800
+            handler.postDelayed(bargePoll, POLL_MS)
+        } catch (t: Throwable) {
+            bargeActive = false
+            runCatching { bargeRecorder?.release() }
+            bargeRecorder = null
+        }
+    }
+
+    private val bargePoll = object : Runnable {
+        override fun run() {
+            if (!bargeActive) return
+            val amp = runCatching { bargeRecorder?.maxAmplitude ?: 0 }.getOrDefault(0)
+            samples++
+            // Pierwsze ~400ms – kalibracja tła
+            if (samples <= 4) {
+                if (amp > calibratedBaseline) calibratedBaseline = amp
+            } else if (amp > calibratedBaseline * BARGE_MULTIPLIER && amp > MIN_AMPLITUDE) {
+                stopBargeIn()
+                stopSpeaking()
+                listener.onBargeIn()
+                return
+            }
+            handler.postDelayed(this, POLL_MS)
+        }
+    }
+
+    private fun stopBargeIn() {
+        if (!bargeActive && bargeRecorder == null) return
+        bargeActive = false
+        handler.removeCallbacks(bargePoll)
+        runCatching { bargeRecorder?.stop() }
+        runCatching { bargeRecorder?.release() }
+        bargeRecorder = null
+        bargeFile?.delete()
+        bargeFile = null
     }
 
     private fun createListener() = object : RecognitionListener {
@@ -163,6 +241,10 @@ class VoiceEngine(
     }
 
     companion object {
+        private const val POLL_MS = 120L
+        private const val BARGE_MULTIPLIER = 3.0f
+        private const val MIN_AMPLITUDE = 3500
+
         fun errorToText(code: Int): String = when (code) {
             SpeechRecognizer.ERROR_AUDIO -> "Problem z mikrofonem."
             SpeechRecognizer.ERROR_CLIENT -> "Błąd klienta mowy."

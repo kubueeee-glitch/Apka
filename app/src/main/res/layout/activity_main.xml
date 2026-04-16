@@ -14,14 +14,36 @@
         android:layout_height="wrap_content"
         android:layout_marginStart="20dp"
         android:layout_marginTop="24dp"
-        android:layout_marginEnd="20dp"
+        android:layout_marginEnd="8dp"
         android:text="@string/app_name"
         android:textColor="@color/text"
         android:textSize="28sp"
         android:textStyle="bold"
-        app:layout_constraintEnd_toStartOf="@id/settingsButton"
+        app:layout_constraintEnd_toStartOf="@id/personaButton"
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintTop_toTopOf="parent" />
+
+    <com.google.android.material.button.MaterialButton
+        android:id="@+id/personaButton"
+        style="@style/Widget.MaterialComponents.Button.TextButton"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="20dp"
+        android:layout_marginEnd="4dp"
+        android:insetTop="0dp"
+        android:insetBottom="0dp"
+        android:minHeight="0dp"
+        android:paddingHorizontal="12dp"
+        android:paddingVertical="6dp"
+        android:text="★ Kumpel"
+        android:textAllCaps="false"
+        android:textColor="@color/accent"
+        android:textSize="13sp"
+        app:cornerRadius="20dp"
+        app:layout_constraintEnd_toStartOf="@id/settingsButton"
+        app:layout_constraintTop_toTopOf="parent"
+        app:strokeColor="@color/surface_high"
+        app:strokeWidth="1dp" />
 
     <ImageButton
         android:id="@+id/settingsButton"

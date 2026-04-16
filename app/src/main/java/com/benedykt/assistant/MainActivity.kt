@@ -1,33 +1,50 @@
 package com.benedykt.assistant
 
 import android.Manifest
+import android.app.Activity
 import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.provider.MediaStore
 import android.text.InputType
 import android.view.View
 import android.widget.EditText
+import androidx.activity.result.ActivityResultLauncher
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
 import androidx.lifecycle.lifecycleScope
 import androidx.recyclerview.widget.LinearLayoutManager
 import com.benedykt.assistant.databinding.ActivityMainBinding
 import kotlinx.coroutines.launch
+import java.io.ByteArrayOutputStream
+import java.io.File
 
-class MainActivity : AppCompatActivity(), VoiceEngine.Listener {
+class MainActivity : AppCompatActivity(), VoiceEngine.Listener, PhoneController.Callbacks {
 
     private lateinit var binding: ActivityMainBinding
     private lateinit var prefs: SharedPreferences
     private lateinit var voice: VoiceEngine
     private lateinit var controller: PhoneController
     private lateinit var gemini: GeminiClient
+    private lateinit var memory: MemoryStore
+    private lateinit var skills: SkillsStore
+    private lateinit var notes: NotesStore
+    private lateinit var personas: PersonaStore
     private val adapter = MessageAdapter()
     private var busy = false
+    private var pendingVisionQuestion: String? = null
+    private var cameraPhotoUri: Uri? = null
+
+    private lateinit var cameraLauncher: ActivityResultLauncher<Intent>
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -35,9 +52,28 @@ class MainActivity : AppCompatActivity(), VoiceEngine.Listener {
         setContentView(binding.root)
 
         prefs = getSharedPreferences("benedykt", Context.MODE_PRIVATE)
-        controller = PhoneController(this)
-        gemini = GeminiClient(prefs.getString(KEY_API, "").orEmpty())
+        memory = MemoryStore(this)
+        skills = SkillsStore(this)
+        notes = NotesStore(this)
+        personas = PersonaStore(this)
+        controller = PhoneController(this, memory, skills, notes, personas, this)
+        gemini = GeminiClient(
+            prefs.getString(KEY_API, "").orEmpty(),
+            memory, skills, personas
+        )
         voice = VoiceEngine(this, this)
+
+        cameraLauncher = registerForActivityResult(
+            ActivityResultContracts.StartActivityForResult()
+        ) { result ->
+            if (result.resultCode == Activity.RESULT_OK) handleCameraResult()
+            else {
+                addSystemMessage("Anulowano zdjęcie.")
+                pendingVisionQuestion = null
+                busy = false
+                binding.statusText.text = getString(R.string.status_idle)
+            }
+        }
 
         binding.messages.layoutManager = LinearLayoutManager(this).apply {
             stackFromEnd = true
@@ -46,7 +82,8 @@ class MainActivity : AppCompatActivity(), VoiceEngine.Listener {
 
         binding.micButton.setOnClickListener { startAssistantTurn() }
         binding.stopButton.setOnClickListener { stopCurrent() }
-        binding.settingsButton.setOnClickListener { askForApiKey() }
+        binding.settingsButton.setOnClickListener { openSettingsMenu() }
+        binding.personaButton.setOnClickListener { showPersonaPicker() }
         binding.sendButton.setOnClickListener {
             val t = binding.textInput.text?.toString()?.trim().orEmpty()
             if (t.isNotEmpty()) {
@@ -57,9 +94,10 @@ class MainActivity : AppCompatActivity(), VoiceEngine.Listener {
 
         ensurePermissions()
         voice.init()
+        refreshPersonaBadge()
 
         addSystemMessage(
-            "Cześć! Jestem Benedykt. Naciśnij mikrofon albo powiedz \"Hej Benedykt\"."
+            "Cześć! Jestem Benedykt. Naciśnij mikrofon lub powiedz \"Hej Benedykt\"."
         )
 
         if (prefs.getString(KEY_API, "").isNullOrBlank()) {
@@ -80,7 +118,6 @@ class MainActivity : AppCompatActivity(), VoiceEngine.Listener {
 
     override fun onResume() {
         super.onResume()
-        // Zatrzymaj nasłuch wake word gdy okno aplikacji jest aktywne
         stopService(Intent(this, WakeWordService::class.java))
     }
 
@@ -126,26 +163,123 @@ class MainActivity : AppCompatActivity(), VoiceEngine.Listener {
         lifecycleScope.launch {
             try {
                 var response = gemini.sendMessage(userText)
-                // Pozwól modelowi wywołać funkcję (ewentualnie wiele razy)
-                var guard = 0
-                while (response.functionCall != null && guard < 5) {
-                    val call = response.functionCall!!
-                    addSystemMessage("[akcja: ${call.name}]")
-                    val result = controller.execute(call)
-                    response = gemini.sendFunctionResult(call.name, result)
-                    guard++
-                }
-                val reply = response.text.ifBlank { "Gotowe." }
-                addAssistantMessage(reply)
-                binding.statusText.text = getString(R.string.status_speaking)
-                voice.speak(reply)
+                loopFunctionCalls(response)
             } catch (t: Throwable) {
-                val msg = t.message ?: "Błąd komunikacji z Gemini."
-                addSystemMessage("Błąd: $msg")
-                binding.statusText.text = getString(R.string.status_idle)
-                busy = false
+                handleError(t)
             }
         }
+    }
+
+    private suspend fun loopFunctionCalls(first: GeminiResponse) {
+        var response = first
+        var guard = 0
+        while (response.functionCall != null && guard < 10) {
+            val call = response.functionCall!!
+            addSystemMessage("[akcja: ${call.name}]")
+            val result = controller.execute(call)
+
+            if (call.name == "set_persona" && result.optString("status") == "ok") {
+                runOnUiThread { refreshPersonaBadge() }
+            }
+            if (call.name == "analyze_image") {
+                // Dalsza część konwersacji odbędzie się po powrocie z aparatu
+                busy = false
+                binding.statusText.text = getString(R.string.status_idle)
+                return
+            }
+
+            response = gemini.sendFunctionResult(call.name, result)
+            guard++
+        }
+        val reply = response.text.ifBlank { "Gotowe." }
+        addAssistantMessage(reply)
+        binding.statusText.text = getString(R.string.status_speaking)
+        voice.speak(reply)
+    }
+
+    private fun handleError(t: Throwable) {
+        val msg = t.message ?: "Błąd komunikacji z Gemini."
+        addSystemMessage("Błąd: $msg")
+        binding.statusText.text = getString(R.string.status_idle)
+        busy = false
+    }
+
+    // --- Vision --- //
+
+    override fun onRequestVision(question: String?) {
+        pendingVisionQuestion = question
+        runOnUiThread { startCameraCapture() }
+    }
+
+    private fun startCameraCapture() {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            ActivityCompat.requestPermissions(
+                this, arrayOf(Manifest.permission.CAMERA), REQ_PERMS
+            )
+            return
+        }
+        val photo = File(cacheDir, "vision_" + System.currentTimeMillis() + ".jpg")
+        val uri = FileProvider.getUriForFile(
+            this, "$packageName.fileprovider", photo
+        )
+        cameraPhotoUri = uri
+        val intent = Intent(MediaStore.ACTION_IMAGE_CAPTURE).apply {
+            putExtra(MediaStore.EXTRA_OUTPUT, uri)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+        }
+        try {
+            cameraLauncher.launch(intent)
+        } catch (t: Throwable) {
+            addSystemMessage("Nie udało się otworzyć aparatu: ${t.message}")
+        }
+    }
+
+    private fun handleCameraResult() {
+        val uri = cameraPhotoUri ?: return
+        val bytes = compressImage(uri) ?: run {
+            addSystemMessage("Nie udało się odczytać zdjęcia.")
+            return
+        }
+        val question = pendingVisionQuestion
+            ?: "Opisz krótko po polsku, co widzisz na tym zdjęciu."
+        pendingVisionQuestion = null
+        addSystemMessage("[wysyłam zdjęcie do analizy…]")
+        busy = true
+        binding.statusText.text = getString(R.string.status_thinking)
+        lifecycleScope.launch {
+            try {
+                val response = gemini.sendImageMessage(question, bytes)
+                loopFunctionCalls(response)
+            } catch (t: Throwable) {
+                handleError(t)
+            }
+        }
+    }
+
+    private fun compressImage(uri: Uri): ByteArray? {
+        return try {
+            contentResolver.openInputStream(uri)?.use { input ->
+                val bmp = android.graphics.BitmapFactory.decodeStream(input)
+                val scaled = scaleBitmap(bmp, 1280)
+                val out = ByteArrayOutputStream()
+                scaled.compress(Bitmap.CompressFormat.JPEG, 80, out)
+                out.toByteArray()
+            }
+        } catch (t: Throwable) {
+            null
+        }
+    }
+
+    private fun scaleBitmap(src: Bitmap, maxSide: Int): Bitmap {
+        val w = src.width
+        val h = src.height
+        val longest = maxOf(w, h)
+        if (longest <= maxSide) return src
+        val ratio = maxSide.toFloat() / longest
+        return Bitmap.createScaledBitmap(src, (w * ratio).toInt(), (h * ratio).toInt(), true)
     }
 
     // --- UI helpers --- //
@@ -163,6 +297,94 @@ class MainActivity : AppCompatActivity(), VoiceEngine.Listener {
     private fun addSystemMessage(text: String) {
         adapter.add(Message(Message.Role.SYSTEM, text))
         binding.messages.scrollToPosition(adapter.itemCount - 1)
+    }
+
+    private fun refreshPersonaBadge() {
+        binding.personaButton.text = "\u2605 " + personas.current().label
+    }
+
+    // --- Menus --- //
+
+    private fun openSettingsMenu() {
+        val opts = arrayOf(
+            "Klucz Gemini API",
+            "Osobowość",
+            "Wyczyść pamięć (${memory.all().size})",
+            "Wyczyść historię rozmowy",
+            "Moje skille (${skills.all().size})",
+            "Moje notatki (${notes.all().size})"
+        )
+        AlertDialog.Builder(this)
+            .setTitle("Ustawienia Benedykta")
+            .setItems(opts) { _, which ->
+                when (which) {
+                    0 -> askForApiKey()
+                    1 -> showPersonaPicker()
+                    2 -> confirmWipeMemory()
+                    3 -> {
+                        gemini.clearHistory()
+                        addSystemMessage("Wyczyszczono historię rozmowy.")
+                    }
+                    4 -> showSkills()
+                    5 -> showNotes()
+                }
+            }
+            .show()
+    }
+
+    private fun showPersonaPicker() {
+        val values = PersonaStore.Persona.values()
+        val labels = values.map { it.label }.toTypedArray()
+        val current = values.indexOf(personas.current())
+        AlertDialog.Builder(this)
+            .setTitle("Osobowość Benedykta")
+            .setSingleChoiceItems(labels, current) { dialog, which ->
+                personas.set(values[which].id)
+                refreshPersonaBadge()
+                addSystemMessage("Zmiana osobowości: ${values[which].label}.")
+                dialog.dismiss()
+            }
+            .setNegativeButton("Zamknij", null)
+            .show()
+    }
+
+    private fun confirmWipeMemory() {
+        AlertDialog.Builder(this)
+            .setTitle("Wyczyścić całą pamięć Benedykta?")
+            .setMessage("Zapomni wszystkie fakty o Tobie. Skille i notatki zostaną.")
+            .setPositiveButton("Wyczyść") { _, _ ->
+                memory.clear()
+                addSystemMessage("Pamięć wyczyszczona.")
+            }
+            .setNegativeButton("Anuluj", null)
+            .show()
+    }
+
+    private fun showSkills() {
+        val list = skills.all()
+        if (list.isEmpty()) {
+            addSystemMessage("Nie masz jeszcze zdefiniowanych skilli.")
+            return
+        }
+        val body = list.joinToString("\n\n") { "• ${it.name}\n  ${it.description.ifBlank { it.steps }}" }
+        AlertDialog.Builder(this)
+            .setTitle("Twoje skille")
+            .setMessage(body)
+            .setPositiveButton("OK", null)
+            .show()
+    }
+
+    private fun showNotes() {
+        val list = notes.all()
+        if (list.isEmpty()) {
+            addSystemMessage("Nie masz notatek.")
+            return
+        }
+        AlertDialog.Builder(this)
+            .setTitle("Twoje notatki")
+            .setMessage(notes.format(list))
+            .setPositiveButton("OK", null)
+            .show()
     }
 
     // --- VoiceEngine.Listener --- //
@@ -194,10 +416,17 @@ class MainActivity : AppCompatActivity(), VoiceEngine.Listener {
     override fun onSpeechFinished() {
         busy = false
         binding.statusText.text = getString(R.string.status_idle)
-        // Automatyczny tryb konwersacji – po odpowiedzi asystenta wróć do nasłuchu
         binding.root.postDelayed({
             if (!busy && !isFinishing) startAssistantTurn()
         }, 400)
+    }
+
+    override fun onBargeIn() {
+        runOnUiThread {
+            addSystemMessage("[przerwano – słucham]")
+            busy = false
+            startAssistantTurn()
+        }
     }
 
     override fun onTtsReady(available: Boolean) {

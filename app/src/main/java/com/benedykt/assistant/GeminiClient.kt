@@ -1,5 +1,6 @@
 package com.benedykt.assistant
 
+import android.util.Base64
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
@@ -11,15 +12,19 @@ import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 
 /**
- * Klient API Google Gemini (darmowy gemini-2.0-flash).
+ * Klient API Google Gemini (darmowy gemini-2.0-flash, obsługujący multimodal).
  *
  * Pobierz DARMOWY klucz na: https://aistudio.google.com/apikey
  *
- * Utrzymuje historię konwersacji oraz listę narzędzi (function calling),
- * dzięki którym model może sterować telefonem.
+ * Trzyma historię konwersacji oraz zestaw narzędzi (function calling).
+ * System prompt jest generowany dynamicznie: zawiera aktualną pamięć
+ * użytkownika, jego skille i wybraną osobowość.
  */
 class GeminiClient(
     private var apiKey: String,
+    private val memory: MemoryStore,
+    private val skills: SkillsStore,
+    private val personas: PersonaStore,
     private val model: String = "gemini-2.0-flash"
 ) {
     private val client = OkHttpClient.Builder()
@@ -30,20 +35,22 @@ class GeminiClient(
 
     private val history = mutableListOf<JSONObject>()
 
-    private val systemInstruction = """
-        Jesteś Benedykt – inteligentny, przyjacielski asystent głosowy na telefon w języku polskim.
-        Zwracaj się do użytkownika zwięźle, naturalnie i ciepło, jak dobry kumpel.
-        Odpowiadaj tylko po polsku, chyba że użytkownik wyraźnie zmieni język.
+    private val basePrompt = """
+        Jesteś Benedykt – inteligentny, ciepły asystent głosowy po polsku.
         Twoje odpowiedzi są odczytywane na głos, więc:
           - NIE używaj markdowna, gwiazdek, emoji ani list wypunktowanych.
           - Pisz krótko (1-3 zdania), chyba że użytkownik prosi o szczegóły.
-          - Używaj naturalnej, mówionej polszczyzny.
-        Kiedy użytkownik prosi Cię o operację na telefonie (otwórz aplikację, zadzwoń,
-        wyślij SMS, ustaw alarm, włącz latarkę, zmień głośność, włącz WiFi/Bluetooth,
-        wyszukaj coś itp.) – WYWOŁAJ odpowiednią funkcję zamiast tylko mówić, że to zrobiłeś.
-        Po udanym wywołaniu funkcji potwierdź krótko po polsku, np. "Już otwieram…".
-        Jeśli rozmowa jest zwykła (small talk, pytania, rozmowa) – po prostu odpowiedz tekstem,
-        bez wywoływania funkcji.
+          - Używaj naturalnej mówionej polszczyzny.
+        Kiedy użytkownik prosi o operację na telefonie (otwórz apkę, zadzwoń,
+        wyślij SMS, alarm, latarka, głośność, WiFi/Bluetooth, wyszukiwanie itd.)
+        – WYWOŁAJ odpowiednią funkcję zamiast tylko mówić, że to zrobiłeś.
+        Zapamiętuj ważne fakty o użytkowniku przez funkcję remember (imię,
+        preferencje, bliscy, adresy, ulubione aplikacje). Nie pytaj za każdym
+        razem o to samo – sprawdź swoją pamięć.
+        Jeśli użytkownik definiuje własną komendę ("stwórz tryb nocny który…"),
+        wywołaj create_skill. Gdy użytkownik wypowie nazwę zdefiniowanego skilla,
+        wywołaj run_skill – zostanie Ci zwrócona lista kroków, wykonaj je w kolejności.
+        Dla zwykłej rozmowy (small talk, pytania) – odpowiadaj tekstem bez funkcji.
     """.trimIndent()
 
     fun setApiKey(key: String) {
@@ -54,10 +61,6 @@ class GeminiClient(
         history.clear()
     }
 
-    /**
-     * Wysyła wiadomość użytkownika do Gemini i zwraca odpowiedź.
-     * Wynik to albo tekst do wypowiedzenia, albo wywołanie funkcji (tool call).
-     */
     suspend fun sendMessage(userText: String): GeminiResponse = withContext(Dispatchers.IO) {
         val userMessage = JSONObject().apply {
             put("role", "user")
@@ -70,8 +73,30 @@ class GeminiClient(
     }
 
     /**
-     * Wysyła do modelu wynik wykonanej funkcji, żeby dostać finalną odpowiedź głosową.
+     * Wysyła wiadomość z obrazem (np. ze zdjęcia z aparatu) – do trybu wizji.
      */
+    suspend fun sendImageMessage(
+        userText: String,
+        imageBytes: ByteArray,
+        mimeType: String = "image/jpeg"
+    ): GeminiResponse = withContext(Dispatchers.IO) {
+        val parts = JSONArray()
+        parts.put(JSONObject().put("text", userText.ifBlank { "Co widzisz na tym zdjęciu?" }))
+        parts.put(
+            JSONObject().put(
+                "inlineData",
+                JSONObject()
+                    .put("mimeType", mimeType)
+                    .put("data", Base64.encodeToString(imageBytes, Base64.NO_WRAP))
+            )
+        )
+        val userMessage = JSONObject().put("role", "user").put("parts", parts)
+        history.add(userMessage)
+        val response = callApi()
+        history.add(response.rawContent)
+        response
+    }
+
     suspend fun sendFunctionResult(
         name: String,
         result: JSONObject
@@ -106,13 +131,29 @@ class GeminiClient(
         val contents = JSONArray()
         history.forEach { contents.put(it) }
 
+        val systemPrompt = buildString {
+            append(basePrompt)
+            append("\n\nAktywna osobowość: ")
+            append(personas.current().prompt)
+            val mem = memory.asPromptContext()
+            if (mem.isNotBlank()) {
+                append("\n\n")
+                append(mem)
+            }
+            val sk = skills.asPromptContext()
+            if (sk.isNotBlank()) {
+                append("\n\n")
+                append(sk)
+            }
+        }
+
         val body = JSONObject().apply {
             put("contents", contents)
             put(
                 "systemInstruction",
                 JSONObject().put(
                     "parts",
-                    JSONArray().put(JSONObject().put("text", systemInstruction))
+                    JSONArray().put(JSONObject().put("text", systemPrompt))
                 )
             )
             put("tools", JSONArray().put(JSONObject().put("functionDeclarations", buildTools())))
@@ -170,7 +211,6 @@ class GeminiClient(
                 textBuilder.append(part.getString("text"))
             }
         }
-        // Upewnij się, że w historii ten obiekt ma poprawną rolę "model"
         if (!content.has("role")) content.put("role", "model")
         return GeminiResponse(
             text = textBuilder.toString().trim(),
@@ -179,36 +219,36 @@ class GeminiClient(
         )
     }
 
-    /** Lista funkcji (narzędzi), które model może wywołać. */
     private fun buildTools(): JSONArray {
         val tools = JSONArray()
 
+        // --- Sterowanie telefonem --- //
         tools.put(
             func(
                 "open_app",
-                "Otwiera aplikację zainstalowaną na telefonie po jej nazwie (np. Spotify, YouTube, Ustawienia, Aparat).",
-                mapOf("app_name" to "Nazwa aplikacji do otwarcia, np. 'Spotify'."),
+                "Otwiera aplikację zainstalowaną na telefonie po nazwie.",
+                mapOf("app_name" to "Nazwa aplikacji np. 'Spotify'."),
                 required = listOf("app_name")
             )
         )
         tools.put(
             func(
                 "make_call",
-                "Dzwoni pod podany numer telefonu lub do kontaktu po imieniu.",
+                "Dzwoni pod numer lub do kontaktu po imieniu.",
                 mapOf(
-                    "number" to "Numer telefonu w formacie międzynarodowym lub krajowym, np. '+48123456789'.",
-                    "contact_name" to "Zamiast numeru – imię kontaktu z książki telefonicznej."
+                    "number" to "Numer telefonu.",
+                    "contact_name" to "Imię kontaktu z książki telefonicznej."
                 )
             )
         )
         tools.put(
             func(
                 "send_sms",
-                "Wysyła wiadomość SMS na podany numer lub do kontaktu.",
+                "Wysyła wiadomość SMS.",
                 mapOf(
-                    "number" to "Numer odbiorcy (opcjonalne, jeśli podano contact_name).",
-                    "contact_name" to "Imię kontaktu (opcjonalne, jeśli podano number).",
-                    "message" to "Treść wiadomości SMS."
+                    "number" to "Numer odbiorcy.",
+                    "contact_name" to "Imię kontaktu.",
+                    "message" to "Treść wiadomości."
                 ),
                 required = listOf("message")
             )
@@ -218,9 +258,9 @@ class GeminiClient(
                 "set_alarm",
                 "Ustawia alarm na podaną godzinę.",
                 mapOf(
-                    "hour" to "Godzina (0-23) jako liczba całkowita.",
-                    "minute" to "Minuty (0-59) jako liczba całkowita.",
-                    "label" to "Opcjonalna etykieta alarmu."
+                    "hour" to "Godzina (0-23).",
+                    "minute" to "Minuty (0-59).",
+                    "label" to "Opcjonalna etykieta."
                 ),
                 required = listOf("hour", "minute")
             )
@@ -228,120 +268,191 @@ class GeminiClient(
         tools.put(
             func(
                 "set_timer",
-                "Ustawia minutnik na podaną liczbę sekund.",
-                mapOf(
-                    "seconds" to "Liczba sekund minutnika.",
-                    "label" to "Opcjonalna etykieta."
-                ),
+                "Ustawia minutnik na sekundy.",
+                mapOf("seconds" to "Liczba sekund.", "label" to "Etykieta."),
                 required = listOf("seconds")
             )
         )
         tools.put(
             func(
                 "toggle_flashlight",
-                "Włącza lub wyłącza latarkę (tylną lampę błyskową).",
-                mapOf("on" to "true aby włączyć, false aby wyłączyć."),
+                "Włącza/wyłącza latarkę.",
+                mapOf("on" to "true aby włączyć, false wyłączyć."),
                 required = listOf("on")
             )
         )
         tools.put(
             func(
                 "set_volume",
-                "Ustawia głośność multimediów w procentach (0-100).",
-                mapOf("percent" to "Głośność w procentach (0-100)."),
+                "Ustawia głośność multimediów (0-100).",
+                mapOf("percent" to "Głośność w procentach."),
                 required = listOf("percent")
             )
         )
-        tools.put(
-            func(
-                "toggle_bluetooth",
-                "Otwiera ustawienia Bluetooth, żeby użytkownik mógł go włączyć/wyłączyć.",
-                emptyMap()
-            )
-        )
-        tools.put(
-            func(
-                "toggle_wifi",
-                "Otwiera ustawienia Wi-Fi.",
-                emptyMap()
-            )
-        )
+        tools.put(func("toggle_bluetooth", "Otwiera ustawienia Bluetooth.", emptyMap()))
+        tools.put(func("toggle_wifi", "Otwiera ustawienia Wi-Fi.", emptyMap()))
         tools.put(
             func(
                 "open_url",
-                "Otwiera podany adres URL w przeglądarce.",
-                mapOf("url" to "Pełny adres URL, np. https://example.com"),
+                "Otwiera URL w przeglądarce.",
+                mapOf("url" to "Pełny adres URL."),
                 required = listOf("url")
             )
         )
         tools.put(
             func(
                 "web_search",
-                "Wyszukuje podaną frazę w Google (otwiera wyniki w przeglądarce).",
-                mapOf("query" to "Fraza do wyszukania."),
+                "Wyszukuje frazę w Google.",
+                mapOf("query" to "Fraza."),
                 required = listOf("query")
             )
         )
-        tools.put(
-            func(
-                "open_camera",
-                "Otwiera aplikację Aparat.",
-                emptyMap()
-            )
-        )
-        tools.put(
-            func(
-                "take_photo",
-                "Robi zdjęcie (otwiera Aparat w trybie foto).",
-                emptyMap()
-            )
-        )
+        tools.put(func("open_camera", "Otwiera Aparat.", emptyMap()))
+        tools.put(func("take_photo", "Robi zdjęcie.", emptyMap()))
         tools.put(
             func(
                 "open_maps",
-                "Otwiera Mapy Google i nawiguje do podanego miejsca (opcjonalnie).",
-                mapOf("destination" to "Cel podróży lub adres.")
+                "Otwiera Mapy Google z celem nawigacji.",
+                mapOf("destination" to "Adres/miejsce.")
             )
         )
         tools.put(
             func(
                 "open_settings",
-                "Otwiera systemowe ustawienia telefonu (opcjonalnie konkretną sekcję).",
-                mapOf("section" to "Sekcja ustawień: 'wifi', 'bluetooth', 'sound', 'display', 'battery', 'apps' lub puste.")
+                "Otwiera ustawienia systemowe.",
+                mapOf("section" to "'wifi', 'bluetooth', 'sound', 'display', 'battery', 'apps' lub puste.")
             )
         )
         tools.put(
             func(
                 "send_whatsapp",
-                "Wysyła wiadomość na WhatsApp do kontaktu.",
-                mapOf(
-                    "number" to "Numer w formacie międzynarodowym, np. '+48123456789'.",
-                    "message" to "Treść wiadomości."
-                ),
+                "Wysyła wiadomość na WhatsApp.",
+                mapOf("number" to "Numer (międzynarodowy).", "message" to "Treść."),
                 required = listOf("number", "message")
             )
         )
         tools.put(
             func(
                 "play_music",
-                "Odtwarza muzykę (otwiera Spotify/YouTube Music z podanym zapytaniem).",
-                mapOf("query" to "Nazwa utworu, artysty lub playlisty.")
+                "Odtwarza muzykę (Spotify/YouTube Music).",
+                mapOf("query" to "Utwór, artysta lub playlista.")
+            )
+        )
+        tools.put(func("get_battery", "Stan baterii telefonu.", emptyMap()))
+        tools.put(func("get_time", "Aktualny czas i data.", emptyMap()))
+
+        // --- Pamięć --- //
+        tools.put(
+            func(
+                "remember",
+                "Zapamiętuje ważny fakt o użytkowniku, żeby pamiętać go między sesjami.",
+                mapOf(
+                    "topic" to "Krótki klucz, np. 'imię', 'praca', 'ulubiona_muzyka', 'mama'.",
+                    "value" to "Wartość do zapamiętania."
+                ),
+                required = listOf("topic", "value")
             )
         )
         tools.put(
             func(
-                "get_battery",
-                "Zwraca aktualny stan baterii telefonu.",
-                emptyMap()
+                "forget",
+                "Zapomina fakt o podanym temacie.",
+                mapOf("topic" to "Klucz do usunięcia."),
+                required = listOf("topic")
+            )
+        )
+        tools.put(func("list_memory", "Zwraca wszystkie zapamiętane fakty.", emptyMap()))
+
+        // --- Skille / makra --- //
+        tools.put(
+            func(
+                "create_skill",
+                "Tworzy własny skill użytkownika (makro). " +
+                    "'steps' to naturalny opis kroków – przy wywołaniu run_skill Gemini wykona je sekwencyjnie.",
+                mapOf(
+                    "name" to "Krótka nazwa skilla (np. 'tryb_nocny').",
+                    "description" to "Krótki opis, co skill robi.",
+                    "steps" to "Opis kroków w języku naturalnym."
+                ),
+                required = listOf("name", "steps")
             )
         )
         tools.put(
             func(
-                "get_time",
-                "Zwraca aktualną godzinę i datę.",
-                emptyMap()
+                "run_skill",
+                "Zwraca kroki skilla, żeby je kolejno wykonać wywołaniami innych funkcji.",
+                mapOf("name" to "Nazwa skilla."),
+                required = listOf("name")
             )
         )
+        tools.put(
+            func(
+                "delete_skill",
+                "Usuwa skill.",
+                mapOf("name" to "Nazwa skilla."),
+                required = listOf("name")
+            )
+        )
+        tools.put(func("list_skills", "Lista wszystkich skilli.", emptyMap()))
+
+        // --- Notatki --- //
+        tools.put(
+            func(
+                "save_note",
+                "Zapisuje notatkę głosową z kategorią.",
+                mapOf(
+                    "content" to "Treść notatki.",
+                    "category" to "Kategoria (np. 'zakupy', 'praca', 'pomysły')."
+                ),
+                required = listOf("content")
+            )
+        )
+        tools.put(
+            func(
+                "list_notes",
+                "Zwraca notatki (opcjonalnie filtrowane).",
+                mapOf(
+                    "query" to "Tekst do wyszukania.",
+                    "category" to "Kategoria."
+                )
+            )
+        )
+
+        // --- Osobowości --- //
+        tools.put(
+            func(
+                "set_persona",
+                "Zmienia osobowość Benedykta.",
+                mapOf(
+                    "persona" to "Jedna z: " + PersonaStore.Persona.ids.joinToString(", ")
+                ),
+                required = listOf("persona")
+            )
+        )
+
+        // --- Schowek --- //
+        tools.put(func("read_clipboard", "Odczytuje zawartość systemowego schowka.", emptyMap()))
+        tools.put(
+            func(
+                "write_clipboard",
+                "Wpisuje tekst do systemowego schowka.",
+                mapOf("text" to "Tekst do skopiowania."),
+                required = listOf("text")
+            )
+        )
+
+        // --- Wizja / kamera --- //
+        tools.put(
+            func(
+                "analyze_image",
+                "Otwiera aparat, robi zdjęcie i analizuje jego zawartość.",
+                mapOf("question" to "Opcjonalne pytanie o zdjęcie (np. 'co to za roślina?').")
+            )
+        )
+
+        // --- Briefing --- //
+        tools.put(func("morning_briefing", "Szybkie podsumowanie: czas, bateria, pogoda.", emptyMap()))
+
         return tools
     }
 
