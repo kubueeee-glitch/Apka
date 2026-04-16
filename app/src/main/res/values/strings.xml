@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Benedykt</string>
+    <string name="mic">Mikrofon</string>
+    <string name="stop">Stop</string>
+    <string name="send">Wyślij</string>
+    <string name="settings">Ustawienia</string>
+    <string name="text_hint">Napisz wiadomość…</string>
+    <string name="status_idle">Powiedz „Hej Benedykt” albo dotknij mikrofonu</string>
+    <string name="status_listening">Słucham…</string>
+    <string name="status_thinking">Myślę…</string>
+    <string name="status_speaking">Mówię…</string>
+</resources>
