@@ -123,13 +123,42 @@ app/src/main/java/com/benedykt/assistant/
   (wypowiedź + opcjonalne zdjęcie).
 - Nasłuch wake word odbywa się na urządzeniu przez Android `SpeechRecognizer`.
 
+## Dodatkowe integracje (zaimplementowane)
+
+### 📬 Dostęp do powiadomień (`NotificationListenerService`)
+Włącz w Ustawieniach → Powiadomienia → Dostęp do powiadomień → Benedykt.
+- *„Co mam w powiadomieniach?"*
+- *„Odpowiedz Ani: jestem w drodze"* (używa `RemoteInput` – działa dla Messengera,
+  WhatsAppa, Signala, domyślnego SMS itd.)
+
+### 👀 Dostępność – Benedykt widzi i dotyka ekran (`AccessibilityService`)
+Włącz w Ustawieniach → Dostępność → Benedykt.
+- *„Co jest na ekranie?"* – czyta wszystkie widoczne napisy.
+- *„Kliknij w Zaloguj"* – sam znajdzie przycisk i go tapnie (również gestem,
+  jeśli element nie jest bezpośrednio klikalny).
+- *„Przewiń w dół"*, *„wciśnij home"*, *„wróć"*.
+
+### 🏠 Home Assistant
+Ustawienia → Home Assistant → wklej adres (`http://homeassistant.local:8123`)
+i Long-Lived Access Token (Profil → Security).
+- *„Włącz światło w salonie"* (Gemini sam dobiera `light.salon` i `light.turn_on`)
+- *„Jaka jest temperatura w sypialni?"*
+- *„Lista świateł"* → Benedykt woła `ha_list_entities(domain=light)`.
+
+### 🚗 Tryb kierowcy
+Ustawienia → Tryb kierowcy (lub *„włącz tryb kierowcy"*).
+- Wielki przycisk mikrofonu na całym ekranie.
+- Ekran nie gaśnie (`FLAG_KEEP_SCREEN_ON`).
+- Automatyczny restart słuchania po każdej odpowiedzi.
+- **Auto-czytanie powiadomień na głos** – broadcast z listenera trafia
+  do aktywności, która odczytuje je przez TTS (wymaga włączenia dostępu do
+  powiadomień).
+
 ## Pomysły na kolejne iteracje
 
-- NotificationListenerService → *„co mam w powiadomieniach?"*, *„odpowiedz Ani OK"*.
-- Accessibility Service → Benedykt widzi co jest na ekranie aktualnie.
-- Odcisk głosu (tylko właściciel budzi) przez `VoiceInteractionService`.
+- Odcisk głosu (tylko właściciel budzi) przez porównanie MFCC nagrań.
 - Lokalny Whisper.cpp zamiast Google STT (lepsza polszczyzna, offline).
-- Porcupine / openWakeWord dla niezawodnego zawsze-on wake word.
-- Integracja z Home Assistant / Matter → sterowanie domem.
-- Tryb kierowcy – minimalny UI, auto-czytanie powiadomień.
+- Porcupine / openWakeWord dla niezawodnego always-on wake word.
 - Voice journal – automatyczna transkrypcja głosowych wpisów z datą.
+- Obsługa Matter przez ThreadNetwork + CommissioningClient.
+- Widget ekranu głównego z szybkim dostępem do mikrofonu.

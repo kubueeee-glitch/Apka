@@ -38,7 +38,10 @@ class PhoneController(
     /** Callbacki do MainActivity dla funkcji wymagających UI (np. aparat). */
     interface Callbacks {
         fun onRequestVision(question: String?)
+        fun onRequestDriverMode() = Unit
     }
+
+    private val ha by lazy { HomeAssistantClient(context) }
 
     fun execute(call: FunctionCall): JSONObject {
         return try {
@@ -121,6 +124,38 @@ class PhoneController(
 
                 // --- Briefing --- //
                 "morning_briefing" -> morningBriefing()
+
+                // --- Powiadomienia --- //
+                "read_notifications" -> readNotifications(
+                    call.args.optInt("limit", 5),
+                    call.args.optString("app_filter")
+                )
+                "reply_notification" -> replyNotification(
+                    call.args.optString("who"),
+                    call.args.optString("message")
+                )
+
+                // --- Ekran (AccessibilityService) --- //
+                "read_screen" -> readScreen()
+                "tap_text" -> tapText(call.args.optString("text"))
+                "scroll_screen" -> scrollScreen(call.args.optString("direction"))
+                "press_button" -> pressSystemButton(call.args.optString("button"))
+
+                // --- Home Assistant --- //
+                "ha_list_entities" -> haListEntities(call.args.optString("domain"))
+                "ha_get_state" -> haGetState(call.args.optString("entity_id"))
+                "ha_call_service" -> haCallService(
+                    call.args.optString("domain"),
+                    call.args.optString("service"),
+                    call.args.optString("entity_id"),
+                    parseMaybeJson(call.args.opt("data"))
+                )
+
+                // --- Tryb kierowcy --- //
+                "start_driver_mode" -> {
+                    callbacks.onRequestDriverMode()
+                    ok("Uruchamiam tryb kierowcy.")
+                }
 
                 else -> fail("Nieznana funkcja: ${call.name}")
             }
@@ -481,6 +516,122 @@ class PhoneController(
             .put("battery_charging", charging)
     }
 
+    // --- Powiadomienia --- //
+
+    private fun readNotifications(limit: Int, appFilter: String?): JSONObject {
+        val entries = NotificationStore.latest(
+            limit.coerceIn(1, 20),
+            appFilter?.takeIf { it.isNotBlank() }
+        )
+        val arr = JSONArray()
+        entries.forEach {
+            arr.put(
+                JSONObject()
+                    .put("app", it.appLabel)
+                    .put("title", it.title)
+                    .put("text", it.text)
+                    .put("postedAt", it.postedAt)
+                    .put("replyable", it.replyable)
+                    .put("key", it.key)
+            )
+        }
+        return ok(if (entries.isEmpty()) "Brak powiadomień." else "Masz ${entries.size} powiadomień.")
+            .put("notifications", arr)
+            .put("formatted", NotificationStore.format(entries))
+    }
+
+    private fun replyNotification(who: String, message: String): JSONObject {
+        if (message.isBlank()) return fail("Brak treści odpowiedzi.")
+        val listener = BenedyktNotificationListener.instance
+            ?: return fail("Włącz dostęp do powiadomień w ustawieniach systemu.")
+        val entry = NotificationStore.findReplyableFor(who)
+            ?: return fail("Nie znalazłem powiadomienia, na które można odpowiedzieć.")
+        val sent = listener.replyTo(entry.key, message)
+        return if (sent) ok("Odpowiedziałem na powiadomienie od ${entry.appLabel}.")
+        else fail("Nie udało się wysłać odpowiedzi.")
+    }
+
+    // --- Ekran (Accessibility) --- //
+
+    private fun readScreen(): JSONObject {
+        val svc = BenedyktAccessibilityService.instance
+            ?: return fail("Włącz usługę dostępności Benedykta w ustawieniach.")
+        val text = svc.dumpScreenText()
+        return if (text.isBlank()) fail("Nic nie widzę na ekranie.")
+        else ok("Przeczytałem ekran.").put("text", text)
+    }
+
+    private fun tapText(text: String): JSONObject {
+        if (text.isBlank()) return fail("Podaj tekst do kliknięcia.")
+        val svc = BenedyktAccessibilityService.instance
+            ?: return fail("Włącz usługę dostępności Benedykta.")
+        val tapped = svc.tapTextual(text)
+        return if (tapped) ok("Kliknąłem w \"$text\".")
+        else fail("Nie znalazłem \"$text\" na ekranie.")
+    }
+
+    private fun scrollScreen(direction: String): JSONObject {
+        val svc = BenedyktAccessibilityService.instance
+            ?: return fail("Włącz usługę dostępności Benedykta.")
+        val scrolled = svc.scroll(direction.ifBlank { "down" })
+        return if (scrolled) ok("Scroll $direction.")
+        else fail("Nic nie ma do scrollowania.")
+    }
+
+    private fun pressSystemButton(button: String): JSONObject {
+        val svc = BenedyktAccessibilityService.instance
+            ?: return fail("Włącz usługę dostępności Benedykta.")
+        val pressed = svc.pressSystemButton(button)
+        return if (pressed) ok("Nacisnąłem $button.")
+        else fail("Nie mogę nacisnąć: $button.")
+    }
+
+    // --- Home Assistant --- //
+
+    private fun haListEntities(domain: String?): JSONObject {
+        if (!ha.isConfigured()) return fail("Home Assistant nie jest skonfigurowany.")
+        val arr = ha.listEntities(domain?.takeIf { it.isNotBlank() })
+        val short = JSONArray()
+        for (i in 0 until arr.length()) {
+            val o = arr.getJSONObject(i)
+            short.put(
+                JSONObject()
+                    .put("entity_id", o.optString("entity_id"))
+                    .put("state", o.optString("state"))
+                    .put(
+                        "name",
+                        o.optJSONObject("attributes")?.optString("friendly_name") ?: ""
+                    )
+            )
+        }
+        return ok("Znalazłem ${short.length()} encji.").put("entities", short)
+    }
+
+    private fun haGetState(entityId: String): JSONObject {
+        if (!ha.isConfigured()) return fail("Home Assistant nie jest skonfigurowany.")
+        if (entityId.isBlank()) return fail("Brak entity_id.")
+        val state = ha.getState(entityId) ?: return fail("Nie dostałem stanu encji $entityId.")
+        val name = state.optJSONObject("attributes")?.optString("friendly_name") ?: entityId
+        val value = state.optString("state")
+        return ok("$name: $value.")
+            .put("entity_id", entityId)
+            .put("state", value)
+    }
+
+    private fun haCallService(
+        domain: String,
+        service: String,
+        entityId: String?,
+        data: JSONObject?
+    ): JSONObject {
+        if (!ha.isConfigured()) return fail("Home Assistant nie jest skonfigurowany.")
+        if (domain.isBlank() || service.isBlank()) return fail("Brak domeny lub serwisu.")
+        val resp = ha.callService(domain, service, entityId?.takeIf { it.isNotBlank() }, data)
+            ?: return fail("Home Assistant odrzucił żądanie.")
+        return ok("Wykonano $domain.$service${entityId?.let { " na $it" } ?: ""}.")
+            .put("response", resp)
+    }
+
     // --- Helpers --- //
 
     private fun resolveNumber(number: String?, contactName: String?): String? {
@@ -512,4 +663,14 @@ class PhoneController(
 
     private fun fail(msg: String): JSONObject =
         JSONObject().put("status", "error").put("message", msg)
+
+    private fun parseMaybeJson(value: Any?): JSONObject? {
+        return when (value) {
+            null, JSONObject.NULL -> null
+            is JSONObject -> value
+            is String -> if (value.isBlank()) null
+            else runCatching { JSONObject(value) }.getOrNull()
+            else -> null
+        }
+    }
 }

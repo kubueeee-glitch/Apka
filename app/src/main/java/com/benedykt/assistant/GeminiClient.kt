@@ -453,6 +453,101 @@ class GeminiClient(
         // --- Briefing --- //
         tools.put(func("morning_briefing", "Szybkie podsumowanie: czas, bateria, pogoda.", emptyMap()))
 
+        // --- Powiadomienia --- //
+        tools.put(
+            func(
+                "read_notifications",
+                "Czyta najnowsze powiadomienia z telefonu (wymaga dostępu do powiadomień).",
+                mapOf(
+                    "limit" to "Ile powiadomień zwrócić (1-20, domyślnie 5).",
+                    "app_filter" to "Opcjonalny filtr aplikacji (fragment nazwy)."
+                )
+            )
+        )
+        tools.put(
+            func(
+                "reply_notification",
+                "Odpowiada tekstowo na najnowsze powiadomienie pasujące do nadawcy (np. Messenger, SMS, WhatsApp).",
+                mapOf(
+                    "who" to "Imię nadawcy lub nazwa aplikacji.",
+                    "message" to "Treść odpowiedzi."
+                ),
+                required = listOf("message")
+            )
+        )
+
+        // --- Ekran (AccessibilityService) --- //
+        tools.put(
+            func(
+                "read_screen",
+                "Zwraca wszystkie widoczne napisy z aktualnego ekranu telefonu.",
+                emptyMap()
+            )
+        )
+        tools.put(
+            func(
+                "tap_text",
+                "Dotyka przycisk/element na ekranie po zawartym w nim tekście.",
+                mapOf("text" to "Tekst lub opis elementu do kliknięcia."),
+                required = listOf("text")
+            )
+        )
+        tools.put(
+            func(
+                "scroll_screen",
+                "Przewija aktualny ekran.",
+                mapOf("direction" to "'up', 'down', 'left' lub 'right'."),
+                required = listOf("direction")
+            )
+        )
+        tools.put(
+            func(
+                "press_button",
+                "Wciska systemowy przycisk.",
+                mapOf("button" to "'home', 'back', 'recents' lub 'notifications'."),
+                required = listOf("button")
+            )
+        )
+
+        // --- Home Assistant --- //
+        tools.put(
+            func(
+                "ha_list_entities",
+                "Lista encji Home Assistant (z opcjonalnym filtrem domeny np. 'light', 'switch', 'climate').",
+                mapOf("domain" to "Domena HA, np. 'light' lub puste dla wszystkich.")
+            )
+        )
+        tools.put(
+            func(
+                "ha_get_state",
+                "Pobiera aktualny stan encji Home Assistant.",
+                mapOf("entity_id" to "Np. 'light.salon'."),
+                required = listOf("entity_id")
+            )
+        )
+        tools.put(
+            func(
+                "ha_call_service",
+                "Wywołuje usługę Home Assistant (np. light.turn_on na encji salonu).",
+                mapOf(
+                    "domain" to "Domena, np. 'light'.",
+                    "service" to "Nazwa serwisu, np. 'turn_on'.",
+                    "entity_id" to "Opcjonalny entity_id celu.",
+                    "data" to "Opcjonalne dodatkowe dane (np. brightness)."
+                ),
+                required = listOf("domain", "service")
+            )
+        )
+
+        // --- Tryb kierowcy --- //
+        tools.put(
+            func(
+                "start_driver_mode",
+                "Uruchamia tryb kierowcy – duże przyciski, auto-czytanie powiadomień, ekran nie gaśnie.",
+                emptyMap()
+            )
+        )
+
         return tools
     }
 

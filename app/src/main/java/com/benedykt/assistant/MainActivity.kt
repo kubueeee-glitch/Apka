@@ -211,6 +211,14 @@ class MainActivity : AppCompatActivity(), VoiceEngine.Listener, PhoneController.
         runOnUiThread { startCameraCapture() }
     }
 
+    override fun onRequestDriverMode() {
+        runOnUiThread { startDriverMode() }
+    }
+
+    private fun startDriverMode() {
+        startActivity(Intent(this, DriverModeActivity::class.java))
+    }
+
     private fun startCameraCapture() {
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
             != PackageManager.PERMISSION_GRANTED
@@ -312,7 +320,11 @@ class MainActivity : AppCompatActivity(), VoiceEngine.Listener, PhoneController.
             "Wyczyść pamięć (${memory.all().size})",
             "Wyczyść historię rozmowy",
             "Moje skille (${skills.all().size})",
-            "Moje notatki (${notes.all().size})"
+            "Moje notatki (${notes.all().size})",
+            "Dostęp do powiadomień",
+            "Dostępność (sterowanie ekranem)",
+            "Home Assistant",
+            "Tryb kierowcy"
         )
         AlertDialog.Builder(this)
             .setTitle("Ustawienia Benedykta")
@@ -327,8 +339,70 @@ class MainActivity : AppCompatActivity(), VoiceEngine.Listener, PhoneController.
                     }
                     4 -> showSkills()
                     5 -> showNotes()
+                    6 -> openNotificationAccess()
+                    7 -> openAccessibilitySettings()
+                    8 -> configureHomeAssistant()
+                    9 -> startDriverMode()
                 }
             }
+            .show()
+    }
+
+    private fun openNotificationAccess() {
+        addSystemMessage(
+            "Włącz 'Benedykt' na liście dostępu do powiadomień, żeby mógł je czytać i odpowiadać."
+        )
+        val intent = Intent("android.settings.ACTION_NOTIFICATION_LISTENER_SETTINGS")
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        runCatching { startActivity(intent) }
+    }
+
+    private fun openAccessibilitySettings() {
+        addSystemMessage(
+            "Włącz usługę 'Benedykt' w Ustawieniach → Dostępność, żeby mógł czytać ekran i dotykać elementów."
+        )
+        val intent = Intent(android.provider.Settings.ACTION_ACCESSIBILITY_SETTINGS)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        runCatching { startActivity(intent) }
+    }
+
+    private fun configureHomeAssistant() {
+        val ha = HomeAssistantClient(this)
+        val layout = android.widget.LinearLayout(this).apply {
+            orientation = android.widget.LinearLayout.VERTICAL
+            setPadding(48, 24, 48, 24)
+        }
+        val urlInput = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
+            hint = "http://homeassistant.local:8123"
+            setText(ha.baseUrl())
+        }
+        val tokenInput = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_TEXT
+            hint = "Long-Lived Access Token"
+            setText(ha.token())
+        }
+        layout.addView(urlInput)
+        layout.addView(tokenInput)
+        AlertDialog.Builder(this)
+            .setTitle("Home Assistant")
+            .setMessage(
+                "Wklej adres swojej instancji Home Assistant oraz długotrwały token dostępu " +
+                    "(Profil → Security → Long-Lived Access Tokens)."
+            )
+            .setView(layout)
+            .setPositiveButton("Zapisz") { _, _ ->
+                ha.configure(
+                    urlInput.text.toString().trim(),
+                    tokenInput.text.toString().trim()
+                )
+                addSystemMessage("Home Assistant skonfigurowany.")
+            }
+            .setNeutralButton("Wyłącz") { _, _ ->
+                ha.clearConfig()
+                addSystemMessage("Wyłączono Home Assistant.")
+            }
+            .setNegativeButton("Anuluj", null)
             .show()
     }
 

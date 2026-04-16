@@ -10,4 +10,5 @@
     <string name="status_listening">Słucham…</string>
     <string name="status_thinking">Myślę…</string>
     <string name="status_speaking">Mówię…</string>
+    <string name="accessibility_description">Benedykt potrzebuje dostępu, żeby „widzieć" zawartość ekranu i móc dotykać elementów, kiedy go o to poprosisz głosowo.</string>
 </resources>
